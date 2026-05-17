@@ -3,9 +3,17 @@ name: aws-nginx-cicd
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**.md' 
+      - docs/**
+      - screenshots/**
 
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**.md'
+      - docs/**
+      - screenshots/**
 
   workflow_dispatch:
     inputs:
