@@ -7,13 +7,14 @@ on:
       - '**.md' 
       - docs/**
       - screenshots/**
-
+      - .gitignore
   pull_request:
     branches: [main]
     paths-ignore:
       - '**.md'
       - docs/**
       - screenshots/**
+      - .gitignore
 
   workflow_dispatch:
     inputs:
