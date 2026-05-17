@@ -1,0 +1,255 @@
+name: aws-nginx-cicd
+
+on:
+  push:
+    branches: [main]
+
+  pull_request:
+    branches: [main]
+
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Choose action: apply or destroy'
+        required: true
+        default: 'destroy'
+        type: choice
+        options:
+          - apply
+          - destroy
+
+jobs:
+  terraform:
+    name: Terraform Deployment
+    runs-on: ubuntu-latest
+
+    # Run automatically on push/pull_request,
+    # or manually when the selected action is "apply".
+    if: ${{ github.event.inputs.action == 'apply' || github.event_name != 'workflow_dispatch' }}
+
+    steps:
+      # Download repository source code.
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Configure AWS credentials for Terraform and AWS CLI.
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-central-1
+
+      # Install Terraform CLI.
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.3.0
+          terraform_wrapper: false
+
+      # Initialize Terraform backend and providers.
+      - name: Terraform Init
+        run: terraform init
+
+      # Create or update AWS infrastructure.
+      - name: Terraform Apply
+        run: terraform apply -auto-approve
+
+      # Read Terraform outputs and save them to a file
+      # so they can be used by later jobs.
+      - name: Capture Outputs
+        run: |
+          INSTANCE_ID=$(terraform output -raw instance_id)
+          ECR_URL=$(terraform output -raw ecr_repository_url)
+
+          if [ -z "$INSTANCE_ID" ]; then
+            echo "Error: Failed to get instance_id from Terraform outputs"
+            exit 1
+          fi
+
+          if [ -z "$ECR_URL" ]; then
+            echo "Error: Failed to get ecr_repository_url from Terraform outputs"
+            exit 1
+          fi
+
+          echo "INSTANCE_ID=$INSTANCE_ID" > terraform_outputs.env
+          echo "ECR_REPOSITORY_URL=$ECR_URL" >> terraform_outputs.env
+
+      # Upload the outputs file as an artifact
+      # to share it with the docker and deploy jobs.
+      - name: Upload Outputs Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-outputs
+          path: terraform_outputs.env
+
+  docker:
+    name: Docker Image Build and Push
+    runs-on: ubuntu-latest
+
+    # Run only after Terraform finishes successfully.
+    needs: terraform
+
+    # Same condition as terraform job.
+    if: ${{ github.event.inputs.action == 'apply' || github.event_name != 'workflow_dispatch' }}
+
+    steps:
+      # Download repository source code.
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Configure AWS credentials for ECR access.
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-central-1
+
+      # Download Terraform outputs from previous job.
+      - name: Download Outputs Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-outputs
+
+      # Load Terraform outputs into GitHub environment variables.
+      - name: Load Outputs
+        run: |
+          . ./terraform_outputs.env
+          echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
+          echo "ECR_REPOSITORY_URL=$ECR_REPOSITORY_URL" >> "$GITHUB_ENV"
+
+      # Authenticate Docker to Amazon ECR.
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Build the Docker image and push it to ECR.
+      # github.sha is used as a unique image tag
+      # so every commit produces a distinct image version.
+      - name: Build, Tag, and Push Docker Image
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t "$ECR_REPOSITORY_URL:$IMAGE_TAG" .
+          docker push "$ECR_REPOSITORY_URL:$IMAGE_TAG"
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+
+    # Wait for both Terraform and Docker jobs.
+    needs: [terraform, docker]
+
+    # Same condition as terraform job.
+    if: ${{ github.event.inputs.action == 'apply' || github.event_name != 'workflow_dispatch' }}
+
+    steps:
+      # Download repository source code.
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Configure AWS credentials.
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-central-1
+
+      # Download Terraform outputs.
+      - name: Download Outputs Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-outputs
+
+      # Load outputs into environment variables.
+      - name: Load Outputs
+        run: |
+          . ./terraform_outputs.env
+          echo "INSTANCE_ID=$INSTANCE_ID" >> "$GITHUB_ENV"
+          echo "ECR_REPOSITORY_URL=$ECR_REPOSITORY_URL" >> "$GITHUB_ENV"
+
+      # Connect to EC2 and deploy the new Docker image.
+      - name: Deploy Docker Container to EC2
+        env:
+          # Use the same tag that was used in the docker job.
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Get EC2 public IP from the instance ID.
+          PUBLIC_IP=$(aws ec2 describe-instances \
+            --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[*].Instances[*].PublicIpAddress' \
+            --output text)
+
+          # Create SSH private key file from GitHub secret.
+          echo "${{ secrets.EC2_PRIVATE_KEY }}" > github-key.pem
+          chmod 400 github-key.pem
+
+          # Connect to EC2 via SSH.
+          ssh -o StrictHostKeyChecking=no -i github-key.pem ec2-user@"$PUBLIC_IP" << EOF
+
+            # Install Docker if it is not already installed.
+            if ! command -v docker &> /dev/null; then
+              sudo yum update -y
+              sudo yum install docker -y
+              sudo systemctl start docker
+              sudo systemctl enable docker
+              sudo usermod -aG docker ec2-user
+            fi
+
+            # Authenticate Docker on EC2 to Amazon ECR.
+            aws ecr get-login-password --region eu-central-1 | \
+              sudo docker login --username AWS --password-stdin "$ECR_REPOSITORY_URL"
+
+            # Pull the exact image version built in this workflow.
+            sudo docker pull "$ECR_REPOSITORY_URL:$IMAGE_TAG"
+
+            # Stop and remove the old container if it exists.
+            sudo docker stop my-nginx-app 2>/dev/null || true
+            sudo docker rm my-nginx-app 2>/dev/null || true
+
+            # Run a new container using the freshly pulled image.
+            sudo docker run -d \
+              --name my-nginx-app \
+              -p 80:80 \
+              "$ECR_REPOSITORY_URL:$IMAGE_TAG"
+          EOF
+
+          # Print the application URL.
+          echo "App is now accessible at: http://$PUBLIC_IP"
+
+  destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+
+    # Run only when the workflow is triggered manually
+    # and the selected action is "destroy".
+    if: ${{ github.event.inputs.action == 'destroy' }}
+
+    steps:
+      # Download repository source code.
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Configure AWS credentials.
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-central-1
+
+      # Install Terraform CLI.
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.3.0
+          terraform_wrapper: false
+
+      # Initialize Terraform.
+      - name: Terraform Init
+        run: terraform init
+
+      # Destroy all infrastructure resources.
+      - name: Terraform Destroy
+        run: terraform destroy -auto-approve
